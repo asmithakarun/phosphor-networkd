@@ -14,6 +14,12 @@
 #include <stdplus/str/maps.hpp>
 #include <xyz/openbmc_project/Common/error.hpp>
 
+#include <sys/inotify.h>
+#include <unistd.h>
+
+#include <sdeventplus/source/io.hpp>
+#include <stdplus/fd/managed.hpp>
+
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -43,12 +49,6 @@ constexpr auto configFile = "/usr/share/network/config.json";
 
 constexpr auto invNetworkIntf =
     "xyz.openbmc_project.Inventory.Item.NetworkInterface";
-#ifdef ENABLE_RBMC_CONFIG
-constexpr auto invPositionIntf =
-    "xyz.openbmc_project.Inventory.Decorator.Position";
-constexpr auto systemPath = "/xyz/openbmc_project/inventory/system";
-constexpr auto inventoryMgr = "xyz.openbmc_project.Inventory.Manager";
-#endif
 constexpr auto invRoot = "/xyz/openbmc_project/inventory";
 constexpr auto mapperBus = "xyz.openbmc_project.ObjectMapper";
 constexpr auto mapperObj = "/xyz/openbmc_project/object_mapper";
@@ -60,8 +60,8 @@ Manager* manager = nullptr;
 std::unique_ptr<sdbusplus::bus::match_t> EthInterfaceMatch = nullptr;
 std::unique_ptr<sdbusplus::bus::match_t> MacAddressMatch = nullptr;
 #ifdef ENABLE_RBMC_CONFIG
-std::unique_ptr<sdbusplus::bus::match_t> BMCPositionMatch = nullptr;
-std::unique_ptr<sdbusplus::bus::match_t> BMCPositionInterfaceMatch = nullptr;
+std::unique_ptr<sdeventplus::source::IO> positionInotifySource = nullptr;
+std::optional<stdplus::ManagedFd> positionInotifyFd;
 #endif
 std::vector<std::string> first_boot_status;
 nlohmann::json configJson;
@@ -229,8 +229,8 @@ static std::optional<uint64_t> readPositionFromFile()
     constexpr auto positionFilePath = "/run/openbmc/bmc_position";
     if (!std::filesystem::exists(positionFilePath))
     {
-        lg2::error("Position file {FILE_PATH} does not exist", "FILE_PATH",
-                   positionFilePath);
+        lg2::info("Position file {FILE_PATH} does not exist", "FILE_PATH",
+                  positionFilePath);
         return std::nullopt;
     }
 
@@ -248,47 +248,13 @@ static std::optional<uint64_t> readPositionFromFile()
 
     if (filePosition == 0 || filePosition == 1)
     {
-        lg2::info("Using position {POSITION} from file instead of D-Bus",
+        lg2::info("BMC Position {POSITION} read successfully from file",
                   "POSITION", filePosition);
         return filePosition;
     }
-    lg2::error("Position in file is also invalid: {POSITION}", "POSITION",
+    lg2::error("Position in file is invalid: {POSITION}", "POSITION",
                filePosition);
     return std::nullopt;
-}
-
-std::optional<uint64_t> getPositionFromInventory(sdbusplus::bus_t& bus)
-{
-    try
-    {
-        auto method =
-            bus.new_method_call(inventoryMgr, systemPath, propIntf, methodGet);
-        method.append(invPositionIntf, "Position");
-
-        auto reply = bus.call(method);
-
-        auto value = reply.unpack<std::variant<uint32_t, uint64_t>>();
-        uint64_t position =
-            std::visit([](auto v) { return static_cast<uint64_t>(v); }, value);
-
-        if (position == 0 || position == 1)
-        {
-            lg2::info("BMC Position read successfully: {POSITION}", "POSITION",
-                      position);
-            return position;
-        }
-        return std::nullopt;
-    }
-    catch (const sdbusplus::exception::SdBusError& e)
-    {
-        lg2::error("D-Bus error reading Position: {ERROR}", "ERROR", e.what());
-        return std::nullopt;
-    }
-    catch (const std::exception& e)
-    {
-        lg2::error("Exception reading Position: {ERROR}", "ERROR", e.what());
-        return std::nullopt;
-    }
 }
 
 /**
@@ -349,16 +315,11 @@ bool configureInternalInterface(std::string_view internalInterface,
     }
 }
 
-bool assignIPBasedOnPosition(sdbusplus::bus_t& bus)
+bool assignIPBasedOnPosition()
 {
     try
     {
-        auto positionOpt = getPositionFromInventory(bus);
-
-        if (!positionOpt)
-        {
-            positionOpt = readPositionFromFile();
-        }
+        auto positionOpt = readPositionFromFile();
         if (!positionOpt)
         {
             return false;
@@ -374,100 +335,88 @@ bool assignIPBasedOnPosition(sdbusplus::bus_t& bus)
     }
 }
 
-void registerBMCPositionPropertyChangeSignal(sdbusplus::bus_t& bus)
+void registerPositionFileInotify()
 {
-    lg2::info(
-        "Registering the PropertyChanged signal matcher for BMC position");
-    auto callback = [&](sdbusplus::message_t& m) {
-        try
-        {
-            lg2::info("Got position property change signal");
+    constexpr auto runDir = "/run/openbmc";
+    constexpr auto fallbackDir = "/run";
+    std::error_code ec;
 
-            std::string interface;
-            std::map<std::string, std::variant<uint64_t, uint32_t>>
-                changedProperties;
-            std::vector<std::string> invalidatedProperties;
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd < 0)
+    {
+        lg2::error("Failed to initialize inotify for BMC position file");
+        return;
+    }
+    positionInotifyFd.emplace(std::move(fd));
 
-            m.read(interface, changedProperties, invalidatedProperties);
+    const char* watchDir = std::filesystem::exists(runDir, ec) ? runDir
+                                                               : fallbackDir;
+    int wd = inotify_add_watch(positionInotifyFd->get(), watchDir,
+                               IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+    if (wd < 0)
+    {
+        lg2::error("Failed to add inotify watch on {DIR}", "DIR", watchDir);
+        positionInotifyFd.reset();
+        return;
+    }
 
-            if (interface == invPositionIntf)
+    lg2::info("Registered inotify watcher on {DIR} for position file", "DIR",
+              watchDir);
+
+    auto event = sdeventplus::Event::get_default();
+    positionInotifySource = std::make_unique<sdeventplus::source::IO>(
+        event, positionInotifyFd->get(), EPOLLIN,
+        [](sdeventplus::source::IO& /*source*/, int fd, uint32_t /*revents*/) {
+            alignas(struct inotify_event) char buffer[4096];
+            ssize_t len = read(fd, buffer, sizeof(buffer));
+            if (len <= 0)
             {
-                for (const auto& property : changedProperties)
+                return;
+            }
+
+            const struct inotify_event* eventPtr = nullptr;
+            for (char* ptr = buffer; ptr < buffer + len;
+                 ptr += sizeof(struct inotify_event) + eventPtr->len)
+            {
+                eventPtr = reinterpret_cast<const struct inotify_event*>(ptr);
+                if (eventPtr->len > 0)
                 {
-                    if (property.first == "Position")
+                    std::string_view filename(eventPtr->name);
+                    if (filename == "bmc_position" || filename == "openbmc")
                     {
-                        lg2::info("Position value changed");
-                        assignIPBasedOnPosition(bus);
-                        break;
+                        lg2::info(
+                            "Position file event detected ({NAME}), attempting IP configuration",
+                            "NAME", filename);
+                        if (assignIPBasedOnPosition())
+                        {
+                            lg2::info(
+                                "Position IP assigned successfully, unregistering inotify watcher");
+                            positionInotifySource = nullptr;
+                            positionInotifyFd.reset();
+                            break;
+                        }
+                        if (filename == "openbmc")
+                        {
+                            inotify_add_watch(fd, runDir,
+                                              IN_CLOSE_WRITE | IN_MOVED_TO);
+                        }
                     }
                 }
             }
-        }
-        catch (const sdbusplus::exception::SdBusError& e)
-        {
-            lg2::error(
-                "D-Bus error in position property change handler: {ERROR}",
-                "ERROR", e.what());
-        }
-        catch (const std::exception& e)
-        {
-            lg2::error("Exception in position property change handler: {ERROR}",
-                       "ERROR", e.what());
-        }
-    };
-
-    std::string propertiesMatchString =
-        ("type='signal',"
-         "interface='org.freedesktop.DBus.Properties',"
-         "path='/xyz/openbmc_project/inventory/system',"
-         "arg0='xyz.openbmc_project.Inventory.Decorator.Position',"
-         "member='PropertiesChanged'");
-
-    BMCPositionMatch = std::make_unique<sdbusplus::bus::match_t>(
-        bus, propertiesMatchString, callback);
+        });
 }
 
-void registerBMCPositionInterfacesAddedSignal(sdbusplus::bus_t& bus)
+void watchBMCPosition()
 {
-    lg2::info("Registering InterfacesAdded Signal Matcher for BMC position");
-    auto callback = [&](sdbusplus::message_t& m) {
-        std::map<DbusObjectPath,
-                 std::map<DbusInterface, std::variant<PropertyValue>>>
-            interfacesProperties;
+    if (assignIPBasedOnPosition())
+    {
+        lg2::info("Position file found on startup and IP assigned");
+        return;
+    }
 
-        sdbusplus::message::object_path objPath;
-        m.read(objPath, interfacesProperties);
-
-        // Only process Position interface from system object
-        if (objPath.str != systemPath)
-        {
-            return;
-        }
-
-        for (auto& interface : interfacesProperties)
-        {
-            if (interface.first == invPositionIntf)
-            {
-                for (const auto& property : interface.second)
-                {
-                    if (property.first == "Position")
-                    {
-                        lg2::info("Position interface added");
-                        assignIPBasedOnPosition(bus);
-                        break;
-                    }
-                }
-            }
-            break;
-        }
-    };
-
-    BMCPositionInterfaceMatch = std::make_unique<sdbusplus::bus::match_t>(
-        bus,
-        "interface='org.freedesktop.DBus.ObjectManager',type='signal',"
-        "member='InterfacesAdded',path='/xyz/openbmc_project/"
-        "inventory'",
-        callback);
+    lg2::info(
+        "Position file not present yet, registering inotify watcher on /run/openbmc");
+    registerPositionFileInotify();
 }
 #endif
 
@@ -612,24 +561,6 @@ void watchEthernetInterface(sdbusplus::bus_t& bus)
     }
 }
 
-#ifdef ENABLE_RBMC_CONFIG
-void watchBMCPosition(sdbusplus::bus_t& bus)
-{
-    registerBMCPositionInterfacesAddedSignal(bus);
-    registerBMCPositionPropertyChangeSignal(bus);
-
-    if (assignIPBasedOnPosition(bus))
-    {
-        lg2::info("Position read successfully and IP assigned");
-    }
-    else
-    {
-        lg2::info(
-            "Position not available yet, signal matchers will wait for Position property");
-    }
-}
-#endif
-
 std::unique_ptr<Runtime> watch(stdplus::PinnedRef<sdbusplus::bus_t> bus,
                                stdplus::PinnedRef<Manager> m)
 {
@@ -638,7 +569,7 @@ std::unique_ptr<Runtime> watch(stdplus::PinnedRef<sdbusplus::bus_t> bus,
     in >> configJson;
     watchEthernetInterface(bus);
 #ifdef ENABLE_RBMC_CONFIG
-    watchBMCPosition(bus);
+    watchBMCPosition();
 #endif
     return nullptr;
 }
